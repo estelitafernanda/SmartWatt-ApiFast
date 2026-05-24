@@ -9,20 +9,11 @@ router = APIRouter()
 
 FUSO_BR = timezone(timedelta(hours=-3))
 
-FATORES_POTENCIA = {
-    "resistencia": 1.0,
-    "arcondicionado": 0.92,
-    "eletronico": 0.97,
-    "iluminacao": 0.95,
-    "outro": 0.90,
-}
-
 
 class LeituraInput(BaseModel):
     sensorId: str
     corrente: float
     tensao: float
-    uid: str
 
 
 @router.post("/")
@@ -30,37 +21,66 @@ async def receber_leitura(dados: LeituraInput):
     db = get_db()
 
     try:
-        doc_usuario = db.collection("usuarios").document(dados.uid).get()
-        if not doc_usuario.exists:
-            raise HTTPException(status_code=404, detail="Usuário não encontrado.")
+        doc_dispositivo = db.collection("dispositivos").document(dados.sensorId).get()
+        if not doc_dispositivo.exists:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Sensor '{dados.sensorId}' não encontrado. "
+                       f"Cadastre o dispositivo no app antes de enviar leituras."
+            )
 
+        dispositivo = doc_dispositivo.to_dict()
+
+        uid = dispositivo.get("uidUsuario", "")
+        if not uid:
+            raise HTTPException(
+                status_code=400,
+                detail="Dispositivo sem usuário vinculado. "
+                       "Recadastre o dispositivo no app."
+            )
+        
+        doc_usuario = db.collection("usuarios").document(uid).get()
+        if not doc_usuario.exists:
+            raise HTTPException(
+                status_code=404,
+                detail="Usuário não encontrado no banco de dados."
+            )
+        
         usuario = doc_usuario.to_dict()
 
         distribuidora_raw = usuario.get("distribuidora", "")
-        distribuidora = distribuidora_raw.get("sigla", "") if isinstance(distribuidora_raw, dict) else distribuidora_raw
+        distribuidora = distribuidora_raw.get("sigla", "") \
+            if isinstance(distribuidora_raw, dict) else distribuidora_raw
         modalidade = usuario.get("modalidade", "")
         classe = usuario.get("classe", "")
-        subgrupo = usuario.get("subgrupo", "B1")
+        subgrupo = usuario.get("subgrupo", "")
 
-        if not distribuidora or not modalidade or not classe:
-            raise HTTPException(status_code=400, detail="Perfil tarifário incompleto.")
+        if not distribuidora or not modalidade or not classe or not subgrupo:
+            raise HTTPException(
+                status_code=400,
+                detail="Perfil tarifário do usuário incompleto. "
+                       "Atualize distribuidora, modalidade, classe e subgrupo no app."
+            )
 
-        doc_dispositivo = db.collection("dispositivos").document(dados.sensorId).get()
-        fator_potencia = 0.92
+        fator_potencia = dispositivo.get("fatorPotencia")
 
-        if doc_dispositivo.exists:
-            disp = doc_dispositivo.to_dict()
-            tipo_aparelho = disp.get("tipoAparelho", "outro")
-            fator_potencia = FATORES_POTENCIA.get(tipo_aparelho, 0.92)
-        else:
-            disp = {}
+        if not fator_potencia:
+            raise HTTPException(
+                status_code=400,
+                detail="Fator de potência não informado. "
+                    "Recadastre o dispositivo no app."
+            )
+
 
         tarifa = await buscar_tarifa_vigente(
             distribuidora, modalidade, classe, subgrupo
         )
 
         if not tarifa:
-            raise HTTPException(status_code=503, detail="Não foi possível obter a tarifa vigente.")
+            raise HTTPException(
+                status_code=503,
+                detail="Não foi possível obter a tarifa vigente da ANEEL."
+            )
 
         potencia_aparente_w = dados.corrente * dados.tensao
         potencia_ativa_w = potencia_aparente_w * fator_potencia
@@ -108,7 +128,7 @@ async def receber_leitura(dados: LeituraInput):
             ref_acumulado.set({
                 "data": hoje,
                 "sensorId": dados.sensorId,
-                "uid": dados.uid,
+                "uid": uid,
                 "custoTotal": custo_leitura,
                 "kwhTotal": potencia_kw / 360,
                 "ultimaAtualizacao": agora,
@@ -159,17 +179,17 @@ async def receber_leitura(dados: LeituraInput):
         if alerta_ativo and potencia_ativa_w > limite_w:
             alertas_existentes = (
                 db.collection("alertas")
-                  .where("uid", "==", dados.uid)
+                  .where("uid", "==", uid)
                   .where("sensorId", "==", dados.sensorId)
                   .where("lido", "==", False)
                   .stream()
             )
 
             if not any(True for _ in alertas_existentes):
-                nome_dispositivo = disp.get("nome", "Dispositivo")
+                nome_dispositivo = dispositivo.get("nome", "Dispositivo")
 
                 db.collection("alertas").add({
-                    "uid": dados.uid,
+                    "uid": uid,
                     "sensorId": dados.sensorId,
                     "nomeDispositivo": nome_dispositivo,
                     "potenciaW": round(potencia_ativa_w, 2),
