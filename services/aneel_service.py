@@ -1,3 +1,4 @@
+import json
 import httpx
 import os
 from datetime import date
@@ -6,8 +7,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 RESOURCE_ID = os.getenv("ANEEL_RESOURCE_ID", "fcf2906c-7c32-4b9b-a637-054e7a5234f4")
-BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search_sql"
+BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
 HEADERS = {"User-Agent": "Mozilla/5.0"}
+PAGE_SIZE = 5000
+MAX_PAGINAS = 40
 
 
 def _parse_valor(valor) -> float:
@@ -18,18 +21,15 @@ def _parse_valor(valor) -> float:
         return 0.0
 
 
-def _sanitizar(valor: str) -> str:
-    return str(valor).replace("'", "''").strip()
-
-
-async def _consultar_sql(sql: str, timeout: int = 90) -> list[dict]:
-    """Executa a consulta SQL na API da ANEEL e sempre loga o motivo de falhas."""
+async def _consultar(params: dict, timeout: int = 90) -> list[dict]:
+    """Uma chamada ao datastore_search. Sempre loga o motivo de falhas."""
+    query = {"resource_id": RESOURCE_ID, "include_total": "false", **params}
     async with httpx.AsyncClient(
         timeout=timeout,
         follow_redirects=True,
         headers=HEADERS,
     ) as client:
-        resposta = await client.get(BASE_URL, params={"sql": sql})
+        resposta = await client.get(BASE_URL, params=query)
 
     if resposta.status_code != 200:
         print(f"[ANEEL] HTTP {resposta.status_code}: {resposta.text[:500]}")
@@ -43,6 +43,19 @@ async def _consultar_sql(sql: str, timeout: int = 90) -> list[dict]:
     return dados.get("result", {}).get("records", [])
 
 
+async def _consultar_tudo(params: dict) -> list[dict]:
+    """Percorre todas as páginas do resultado."""
+    todos: list[dict] = []
+    offset = 0
+    for _ in range(MAX_PAGINAS):
+        pagina = await _consultar({**params, "limit": PAGE_SIZE, "offset": offset})
+        todos.extend(pagina)
+        if len(pagina) < PAGE_SIZE:
+            break
+        offset += PAGE_SIZE
+    return todos
+
+
 async def buscar_tarifa_vigente(
     distribuidora: str,
     modalidade: str,
@@ -51,42 +64,44 @@ async def buscar_tarifa_vigente(
 ) -> dict | None:
     hoje = date.today().isoformat()
 
-    sql = f"""
-        SELECT "SigAgente", "DscModalidadeTarifaria", "DscClasse",
-               "DscSubGrupo", "DscDetalhe",
-               "DscBaseTarifaria", "DscUnidadeTerciaria",
-               "NomPostoTarifario",
-               "VlrTE", "VlrTUSD",
-               "DatInicioVigencia", "DatFimVigencia"
-        FROM "{RESOURCE_ID}"
-        WHERE "SigAgente" = '{_sanitizar(distribuidora)}'
-          AND "DscModalidadeTarifaria" = '{_sanitizar(modalidade)}'
-          AND "DscClasse" = '{_sanitizar(classe)}'
-          AND "DscSubGrupo" = '{_sanitizar(subgrupo)}'
-          AND "DscBaseTarifaria" = 'Tarifa de Aplicação'
-          AND "DscUnidadeTerciaria" = 'MWh'
-          AND "DscDetalhe" = 'Não se aplica'
-          AND "DatInicioVigencia" <= '{hoje}'
-          AND ("DatFimVigencia" >= '{hoje}' OR "DatFimVigencia" IS NULL)
-        ORDER BY "DatInicioVigencia" DESC
-        LIMIT 10
-    """
+    filtros = {
+        "SigAgente": distribuidora.strip(),
+        "DscModalidadeTarifaria": modalidade.strip(),
+        "DscClasse": classe.strip(),
+        "DscSubGrupo": subgrupo.strip(),
+        "DscBaseTarifaria": "Tarifa de Aplicação",
+        "DscUnidadeTerciaria": "MWh",
+        "DscDetalhe": "Não se aplica",
+    }
 
-    print(f"\n Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
+    print(f"\n🔍 Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
 
     try:
-        registros = await _consultar_sql(sql, timeout=60)
+        registros = await _consultar(
+            {
+                "filters": json.dumps(filtros, ensure_ascii=False),
+                "sort": "DatInicioVigencia desc",
+                "limit": 100,
+            },
+            timeout=60,
+        )
     except Exception as e:
         print(f"[ANEEL] erro ao buscar tarifa vigente: {e!r}")
         return None
 
-    if not registros:
+    vigentes = [
+        r for r in registros
+        if (r.get("DatInicioVigencia") or "") <= hoje
+        and (not r.get("DatFimVigencia") or r["DatFimVigencia"] >= hoje)
+    ]
+
+    if not vigentes:
         print("Nenhuma tarifa vigente encontrada!")
         return None
 
     registro = next(
-        (r for r in registros if r.get("NomPostoTarifario") == "Não se aplica"),
-        registros[0],
+        (r for r in vigentes if r.get("NomPostoTarifario") == "Não se aplica"),
+        vigentes[0],
     )
 
     te = _parse_valor(registro.get("VlrTE", "0")) / 1000
@@ -110,30 +125,28 @@ async def buscar_tarifa_vigente(
 async def buscar_distribuidoras() -> list[dict]:
     corte = f"{date.today().year - 2}-01-01"
 
-    sql = f"""
-        SELECT DISTINCT "SigAgente"
-        FROM "{RESOURCE_ID}"
-        WHERE "SigAgente" IS NOT NULL
-          AND "SigAgente" != ''
-          AND LOWER("SigAgente") NOT LIKE '%informado%'
-          AND LOWER("SigAgente") NOT LIKE '%n/a%'
-          AND "DatFimVigencia" >= '{corte}'
-        ORDER BY "SigAgente"
-        LIMIT 300
-    """
-
     try:
-        registros = await _consultar_sql(sql)
+        registros = await _consultar_tudo(
+            {"fields": "SigAgente,DatFimVigencia", "distinct": "true"}
+        )
     except Exception as e:
         print(f"[ANEEL] erro ao buscar distribuidoras: {e!r}")
         return []
 
+    ultima_vigencia: dict[str, str] = {}
+    for r in registros:
+        sigla = (r.get("SigAgente") or "").strip()
+        if not sigla:
+            continue
+        baixa = sigla.lower()
+        if "informado" in baixa or "n/a" in baixa:
+            continue
+        fim = r.get("DatFimVigencia") or "9999-12-31"  
+        if fim > ultima_vigencia.get(sigla, ""):
+            ultima_vigencia[sigla] = fim
+
     return [
-        {
-            "sigla": r["SigAgente"].strip(),
-            "nome": r["SigAgente"].strip(),
-            "ativo": True,
-        }
-        for r in registros
-        if r.get("SigAgente", "").strip()
+        {"sigla": s, "nome": s, "ativo": True}
+        for s in sorted(ultima_vigencia)
+        if ultima_vigencia[s] >= corte
     ]
