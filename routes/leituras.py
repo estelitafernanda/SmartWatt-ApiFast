@@ -214,7 +214,7 @@ async def receber_leitura(dados: LeituraInput):
                             token=token,
                         )
                         messaging.send(message)
-                        print(f"Notificação enviada para {dados.uid}")
+                        print(f"Notificação enviada para {dados.sensorId}")
                     except Exception as e:
                         print(f"Erro ao enviar notificação FCM: {e}")
 

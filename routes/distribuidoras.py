@@ -13,10 +13,12 @@ async def listar_distribuidoras():
         db = get_db()
         docs = db.collection("distribuidoras")\
                  .where("ativo", "==", True)\
-                 .order_by("sigla")\
                  .stream()
 
-        distribuidoras = [doc.to_dict() for doc in docs]
+        distribuidoras = sorted(
+            (doc.to_dict() for doc in docs),
+            key=lambda d: d.get("sigla", ""),
+        )
 
         if not distribuidoras:
             raise HTTPException(
