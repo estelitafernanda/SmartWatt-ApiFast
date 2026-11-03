@@ -1,21 +1,27 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from datetime import datetime, date, timedelta
 from services.firebase_service import get_db
+from services.auth import usuario_autenticado
 import calendar
 
 router = APIRouter()
 
 
 @router.get("/{uid}")
-async def obter_previsao(uid: str):
+async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado)):
     """
     Calcula previsão de gasto mensal com base no acumulado
     de cada dispositivo do usuário nos últimos dias.
     """
+    if uid != uid_logado:
+        raise HTTPException(
+            status_code=403,
+            detail="Você não tem permissão para ver a previsão de outro usuário.",
+        )
+
     db = get_db()
 
     try:
-        # ── 1. Busca dispositivos do usuário ───────────────────
         dispositivos = (
             db.collection("dispositivos")
               .where("uidUsuario", "==", uid)
@@ -42,7 +48,6 @@ async def obter_previsao(uid: str):
             if not sensor_id:
                 continue
 
-            # ── 2. Busca acumulados do mês atual ────────────────
             acumulados = (
                 db.collection("leituras")
                   .document(sensor_id)
@@ -62,7 +67,6 @@ async def obter_previsao(uid: str):
                 kwh_mes += d.get("kwhTotal", 0)
                 dias_com_dados += 1
 
-            # ── 3. Calcula média diária e previsão ───────────────
             if dias_com_dados > 0:
                 media_diaria = custo_mes / dias_com_dados
                 kwh_media_diaria = kwh_mes / dias_com_dados
@@ -88,7 +92,6 @@ async def obter_previsao(uid: str):
                 "diasComDados": dias_com_dados,
             })
 
-        # ── 4. Busca gasto do dia atual (todos os dispositivos) ─
         custo_hoje = 0.0
         for item in resultado:
             acumulado_hoje = (
@@ -117,7 +120,7 @@ async def obter_previsao(uid: str):
         }
 
     except Exception as e:
-        print(f"❌ Erro ao calcular previsão: {e}")
+        print(f"Erro ao calcular previsão: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

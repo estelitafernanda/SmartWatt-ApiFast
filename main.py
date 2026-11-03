@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -6,29 +6,26 @@ import os
 
 from services.firebase_service import inicializar_firebase
 from services.scheduler import iniciar_agendador
+from services.auth import verificar_api_key
 from routes import distribuidoras, leituras, previsao
 
 load_dotenv()
 
-# ─── Inicialização ─────────────────────────────────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("🚀 Iniciando SmartWatt Backend...")
+    print("Iniciando SmartWatt Backend...")
 
-    # Inicializa Firebase
     inicializar_firebase()
-    print("🔥 Firebase conectado!")
+    print("Firebase conectado!")
 
-    # Inicia agendador (atualiza distribuidoras semanalmente)
     iniciar_agendador()
-    print("⏰ Agendador iniciado!")
+    print("Agendador iniciado!")
 
     yield
 
-    print("🛑 Encerrando SmartWatt Backend...")
+    print("Encerrando SmartWatt Backend...")
 
 
-# ─── App ───────────────────────────────────────────────────────────
 app = FastAPI(
     title="SmartWatt API",
     description="Backend IoT para monitoramento inteligente de consumo de energia residencial.",
@@ -36,7 +33,6 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# ─── CORS ──────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,7 +41,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ─── Rotas ─────────────────────────────────────────────────────────
 app.include_router(
     distribuidoras.router,
     prefix="/distribuidoras",
@@ -55,6 +50,7 @@ app.include_router(
     leituras.router,
     prefix="/leitura",
     tags=["Leituras"],
+    dependencies=[Depends(verificar_api_key)],  
 )
 app.include_router(
     previsao.router,
@@ -62,7 +58,6 @@ app.include_router(
     tags=["Previsão"],
 )
 
-# ─── Rota raiz ─────────────────────────────────────────────────────
 @app.get("/", tags=["Status"])
 async def raiz():
     return {
@@ -79,13 +74,11 @@ async def raiz():
     }
 
 
-# ─── Rota de saúde ─────────────────────────────────────────────────
 @app.get("/health", tags=["Status"])
 async def health():
     return {"status": "healthy"}
 
 
-# ─── Rodar localmente ──────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
