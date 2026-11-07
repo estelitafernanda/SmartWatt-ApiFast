@@ -1,19 +1,34 @@
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
-from datetime import datetime, date, timedelta, timezone
-from firebase_admin import messaging
+from pydantic import BaseModel, Field
+from datetime import datetime, timedelta, timezone
+from firebase_admin import firestore, messaging
 from services.firebase_service import get_db
-from services.aneel_service import buscar_tarifa_vigente
+from services.aneel_service import buscar_tarifa_com_cache
 
 router = APIRouter()
 
 FUSO_BR = timezone(timedelta(hours=-3))
 
+INTERVALO_PADRAO_S = 10
+INTERVALO_MAXIMO_S = 120
+
 
 class LeituraInput(BaseModel):
-    sensorId: str
-    corrente: float
-    tensao: float
+    sensorId: str = Field(min_length=1)
+    corrente: float = Field(ge=0, le=150)
+    tensao: float = Field(ge=0, le=300)
+
+
+def _segundos_desde_ultima_leitura(dispositivo: dict, agora: datetime) -> float:
+    """Tempo real desde a leitura anterior, para o kWh não depender do intervalo do ESP32."""
+    ultima = dispositivo.get("ultimaLeitura")
+    if not ultima:
+        return INTERVALO_PADRAO_S
+
+    segundos = (agora - ultima).total_seconds()
+    if segundos <= 0:
+        return INTERVALO_PADRAO_S
+    return min(segundos, INTERVALO_MAXIMO_S)
 
 
 @router.post("/")
@@ -21,7 +36,8 @@ async def receber_leitura(dados: LeituraInput):
     db = get_db()
 
     try:
-        doc_dispositivo = db.collection("dispositivos").document(dados.sensorId).get()
+        ref_dispositivo = db.collection("dispositivos").document(dados.sensorId)
+        doc_dispositivo = ref_dispositivo.get()
         if not doc_dispositivo.exists:
             raise HTTPException(
                 status_code=404,
@@ -31,6 +47,13 @@ async def receber_leitura(dados: LeituraInput):
 
         dispositivo = doc_dispositivo.to_dict()
 
+        if dispositivo.get("removido") or not dispositivo.get("ativo", True):
+            return {
+                "sucesso": False,
+                "ignorada": True,
+                "motivo": "Dispositivo pausado ou removido no app. Leitura descartada.",
+            }
+
         uid = dispositivo.get("uidUsuario", "")
         if not uid:
             raise HTTPException(
@@ -38,14 +61,14 @@ async def receber_leitura(dados: LeituraInput):
                 detail="Dispositivo sem usuário vinculado. "
                        "Recadastre o dispositivo no app."
             )
-        
+
         doc_usuario = db.collection("usuarios").document(uid).get()
         if not doc_usuario.exists:
             raise HTTPException(
                 status_code=404,
                 detail="Usuário não encontrado no banco de dados."
             )
-        
+
         usuario = doc_usuario.to_dict()
 
         distribuidora_raw = usuario.get("distribuidora", "")
@@ -63,115 +86,78 @@ async def receber_leitura(dados: LeituraInput):
             )
 
         fator_potencia = dispositivo.get("fatorPotencia")
-
         if not fator_potencia:
             raise HTTPException(
                 status_code=400,
                 detail="Fator de potência não informado. "
-                    "Recadastre o dispositivo no app."
+                       "Recadastre o dispositivo no app."
             )
 
-
-        tarifa = await buscar_tarifa_vigente(
+        tarifa = await buscar_tarifa_com_cache(
             distribuidora, modalidade, classe, subgrupo
         )
-
         if not tarifa:
             raise HTTPException(
                 status_code=503,
                 detail="Não foi possível obter a tarifa vigente da ANEEL."
             )
 
+        agora = datetime.now(FUSO_BR)
+        hoje = agora.date().isoformat()
+        hora_chave = agora.strftime("%Y-%m-%d-%H")
+
         potencia_aparente_w = dados.corrente * dados.tensao
         potencia_ativa_w = potencia_aparente_w * fator_potencia
         potencia_kw = potencia_ativa_w / 1000
         custo_hora = potencia_kw * tarifa["total"]
-        custo_leitura = custo_hora / 360
 
-        agora = datetime.now(FUSO_BR)
-        hoje = agora.date().isoformat()
+        horas = _segundos_desde_ultima_leitura(dispositivo, agora) / 3600
+        kwh_leitura = potencia_kw * horas
+        custo_leitura = custo_hora * horas
 
-        db.collection("leituras") \
-          .document(dados.sensorId) \
-          .collection("historico") \
-          .add({
-              "corrente": dados.corrente,
-              "tensao": dados.tensao,
-              "potenciaAparenteW": potencia_aparente_w,
-              "potenciaAtivaW": potencia_ativa_w,
-              "fatorPotencia": fator_potencia,
-              "custoHora": custo_hora,
-              "custoLeitura": custo_leitura,
-              "TE": tarifa["TE"],
-              "TUSD": tarifa["TUSD"],
-              "timestamp": agora,
-          })
+        ref_leituras = db.collection("leituras").document(dados.sensorId)
 
-        ref_acumulado = (
-            db.collection("leituras")
-            .document(dados.sensorId)
-            .collection("acumulado")
-            .document(hoje)
-        )
-
-        doc_acumulado = ref_acumulado.get()
-
-        if doc_acumulado.exists:
-            atual = doc_acumulado.to_dict()
-            ref_acumulado.update({
-                "custoTotal": atual.get("custoTotal", 0) + custo_leitura,
-                "kwhTotal": atual.get("kwhTotal", 0) + (potencia_kw / 360),
-                "ultimaAtualizacao": agora,
-                "ultimaPotenciaAtivaW": potencia_ativa_w,
+        if potencia_ativa_w > 0:
+            ref_leituras.collection("historico").add({
+                "corrente": dados.corrente,
+                "tensao": dados.tensao,
+                "potenciaAparenteW": potencia_aparente_w,
+                "potenciaAtivaW": potencia_ativa_w,
+                "fatorPotencia": fator_potencia,
+                "custoHora": custo_hora,
+                "custoLeitura": custo_leitura,
+                "kwhLeitura": kwh_leitura,
+                "TE": tarifa["TE"],
+                "TUSD": tarifa["TUSD"],
+                "timestamp": agora,
             })
-        else:
-            ref_acumulado.set({
+
+            ref_leituras.collection("acumulado").document(hoje).set({
                 "data": hoje,
                 "sensorId": dados.sensorId,
                 "uid": uid,
-                "custoTotal": custo_leitura,
-                "kwhTotal": potencia_kw / 360,
+                "custoTotal": firestore.Increment(custo_leitura),
+                "kwhTotal": firestore.Increment(kwh_leitura),
                 "ultimaAtualizacao": agora,
                 "ultimaPotenciaAtivaW": potencia_ativa_w,
                 "distribuidora": distribuidora,
                 "subgrupo": subgrupo,
                 "TE": tarifa["TE"],
                 "TUSD": tarifa["TUSD"],
-            })
+            }, merge=True)
 
-        hora_chave = agora.strftime("%Y-%m-%d-%H")
-
-        ref_hora = (
-            db.collection("leituras")
-            .document(dados.sensorId)
-            .collection("tempo_real")
-            .document(hora_chave)
-        )
-
-        doc_hora = ref_hora.get()
-        kwh_incremento = potencia_kw / 360
-
-        if doc_hora.exists:
-            atual = doc_hora.to_dict()
-            ref_hora.update({
-                "kwh": atual.get("kwh", 0) + kwh_incremento,
-                "timestamp": agora,
-            })
-        else:
-            ref_hora.set({
+            ref_leituras.collection("tempo_real").document(hora_chave).set({
                 "hora": hora_chave,
-                "kwh": kwh_incremento,
+                "kwh": firestore.Increment(kwh_leitura),
                 "timestamp": agora,
-            })
+            }, merge=True)
 
-        db.collection("dispositivos") \
-            .document(dados.sensorId) \
-            .update({
-                "potenciaW": potencia_ativa_w,
-                "custoHora": custo_hora,
-                "fatorPotencia": fator_potencia,
-                "ultimaLeitura": agora,
-            })
+        ref_dispositivo.update({
+            "potenciaW": potencia_ativa_w,
+            "custoHora": custo_hora,
+            "fatorPotencia": fator_potencia,
+            "ultimaLeitura": agora,
+        })
 
         limite_w = usuario.get("limiteDispositivo", 500)
         alerta_ativo = usuario.get("alertaDispositivo", True)
@@ -182,6 +168,7 @@ async def receber_leitura(dados: LeituraInput):
                   .where("uid", "==", uid)
                   .where("sensorId", "==", dados.sensorId)
                   .where("lido", "==", False)
+                  .limit(1)
                   .stream()
             )
 
@@ -211,6 +198,12 @@ async def receber_leitura(dados: LeituraInput):
                                 "sensorId": dados.sensorId,
                                 "potenciaW": str(round(potencia_ativa_w, 2)),
                             },
+                            android=messaging.AndroidConfig(
+                                priority="high",
+                                notification=messaging.AndroidNotification(
+                                    channel_id="alertas_consumo",
+                                ),
+                            ),
                             token=token,
                         )
                         messaging.send(message)
@@ -225,6 +218,7 @@ async def receber_leitura(dados: LeituraInput):
             "fatorPotencia": fator_potencia,
             "custoHora": round(custo_hora, 4),
             "custoLeitura": round(custo_leitura, 6),
+            "kwhLeitura": round(kwh_leitura, 6),
             "tarifa": {
                 "TE": tarifa["TE"],
                 "TUSD": tarifa["TUSD"],

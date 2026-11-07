@@ -1,4 +1,5 @@
 import json
+import time
 import httpx
 import os
 from datetime import date
@@ -121,6 +122,34 @@ async def buscar_tarifa_vigente(
         "vigenciaFim": registro.get("DatFimVigencia"),
     }
 
+
+CACHE_TARIFA_SEGUNDOS = 6 * 60 * 60
+_cache_tarifa: dict[tuple, tuple[float, dict]] = {}
+
+
+async def buscar_tarifa_com_cache(
+    distribuidora: str,
+    modalidade: str,
+    classe: str,
+    subgrupo: str = "B1",
+) -> dict | None:
+    chave = (distribuidora.strip(), modalidade.strip(), classe.strip(), subgrupo.strip())
+    agora = time.monotonic()
+    em_cache = _cache_tarifa.get(chave)
+
+    if em_cache and agora - em_cache[0] < CACHE_TARIFA_SEGUNDOS:
+        return em_cache[1]
+
+    tarifa = await buscar_tarifa_vigente(*chave)
+    if tarifa:
+        _cache_tarifa[chave] = (agora, tarifa)
+        return tarifa
+
+    if em_cache:
+        print("[ANEEL] falha ao atualizar a tarifa; usando o valor em cache")
+        return em_cache[1]
+
+    return None
 
 async def buscar_distribuidoras() -> list[dict]:
     corte = f"{date.today().year - 2}-01-01"
