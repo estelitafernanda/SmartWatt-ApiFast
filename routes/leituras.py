@@ -1,3 +1,5 @@
+import time
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
@@ -11,6 +13,11 @@ FUSO_BR = timezone(timedelta(hours=-3))
 
 INTERVALO_PADRAO_S = 10
 INTERVALO_MAXIMO_S = 120
+
+# O gasto do mês é recalculado no máximo a cada 5 min por usuário, para não
+# somar os acumulados do mês inteiro a cada leitura.
+VERIFICACAO_MENSAL_S = 5 * 60
+_ultima_verificacao_mensal: dict[str, float] = {}
 
 
 class LeituraInput(BaseModel):
@@ -29,6 +36,100 @@ def _segundos_desde_ultima_leitura(dispositivo: dict, agora: datetime) -> float:
     if segundos <= 0:
         return INTERVALO_PADRAO_S
     return min(segundos, INTERVALO_MAXIMO_S)
+
+
+def _enviar_notificacao(token: str | None, titulo: str, corpo: str, dados: dict) -> None:
+    if not token:
+        return
+    try:
+        messaging.send(messaging.Message(
+            notification=messaging.Notification(title=titulo, body=corpo),
+            data={k: str(v) for k, v in dados.items()},
+            android=messaging.AndroidConfig(
+                priority="high",
+                notification=messaging.AndroidNotification(
+                    channel_id="alertas_consumo",
+                ),
+            ),
+            token=token,
+        ))
+        print(f"Notificação enviada: {titulo}")
+    except Exception as e:
+        print(f"Erro ao enviar notificação FCM: {e}")
+
+
+def _custo_do_mes(db, uid: str, agora: datetime) -> float:
+    """Soma o gasto do mês de todos os dispositivos do usuário (menos os removidos)."""
+    inicio_mes = agora.date().replace(day=1).isoformat()
+    hoje = agora.date().isoformat()
+    total = 0.0
+
+    for doc in db.collection("dispositivos").where("uidUsuario", "==", uid).stream():
+        dispositivo = doc.to_dict()
+        sensor_id = dispositivo.get("sensorId", "")
+        if not sensor_id or dispositivo.get("removido"):
+            continue
+
+        acumulados = (
+            db.collection("leituras")
+              .document(sensor_id)
+              .collection("acumulado")
+              .where("data", ">=", inicio_mes)
+              .where("data", "<=", hoje)
+              .stream()
+        )
+        total += sum(a.to_dict().get("custoTotal", 0) for a in acumulados)
+
+    return total
+
+
+def _verificar_limite_mensal(db, uid: str, usuario: dict, agora: datetime) -> None:
+    """Envia um alerta por mês quando o gasto passa do limite mensal do usuário.
+
+    Se o usuário mudar o limite depois do alerta, o novo limite pode gerar outro.
+    """
+    if not usuario.get("alertaMensal", True):
+        return
+
+    limite = float(usuario.get("limiteMensal", 200))
+    mes = agora.strftime("%Y-%m")
+    enviado = usuario.get("alertaMensalEnviado") or {}
+    if enviado.get("mes") == mes and float(enviado.get("limite", -1)) == limite:
+        return
+
+    agora_s = time.monotonic()
+    if agora_s - _ultima_verificacao_mensal.get(uid, -VERIFICACAO_MENSAL_S) < VERIFICACAO_MENSAL_S:
+        return
+    _ultima_verificacao_mensal[uid] = agora_s
+
+    gasto = _custo_do_mes(db, uid, agora)
+    if gasto <= limite:
+        return
+
+    mensagem = (
+        f"O gasto deste mês chegou a R$ {gasto:.2f} e passou "
+        f"do limite de R$ {limite:.2f}."
+    )
+    db.collection("alertas").add({
+        "uid": uid,
+        "sensorId": "",
+        "tipo": "mensal",
+        "nomeDispositivo": "Gasto do mês",
+        "gastoMes": round(gasto, 2),
+        "limiteMensal": limite,
+        "mensagem": mensagem,
+        "lido": False,
+        "timestamp": agora,
+    })
+    db.collection("usuarios").document(uid).update({
+        "alertaMensalEnviado": {"mes": mes, "limite": limite},
+    })
+    _enviar_notificacao(
+        usuario.get("fcmToken"),
+        "Limite mensal ultrapassado",
+        mensagem,
+        {"tipo": "mensal", "gastoMes": round(gasto, 2)},
+    )
 
 
 @router.post("/")
@@ -186,30 +287,18 @@ async def receber_leitura(dados: LeituraInput):
                     "timestamp": agora,
                 })
 
-                token = usuario.get("fcmToken")
-                if token:
-                    try:
-                        message = messaging.Message(
-                            notification=messaging.Notification(
-                                title="Consumo elevado",
-                                body=f"{nome_dispositivo} está acima do limite!",
-                            ),
-                            data={
-                                "sensorId": dados.sensorId,
-                                "potenciaW": str(round(potencia_ativa_w, 2)),
-                            },
-                            android=messaging.AndroidConfig(
-                                priority="high",
-                                notification=messaging.AndroidNotification(
-                                    channel_id="alertas_consumo",
-                                ),
-                            ),
-                            token=token,
-                        )
-                        messaging.send(message)
-                        print(f"Notificação enviada para {dados.sensorId}")
-                    except Exception as e:
-                        print(f"Erro ao enviar notificação FCM: {e}")
+                _enviar_notificacao(
+                    usuario.get("fcmToken"),
+                    "Consumo elevado",
+                    f"{nome_dispositivo} está acima do limite!",
+                    {"sensorId": dados.sensorId, "potenciaW": round(potencia_ativa_w, 2)},
+                )
+
+        if potencia_ativa_w > 0:
+            try:
+                _verificar_limite_mensal(db, uid, usuario, agora)
+            except Exception as e:
+                print(f"Erro ao verificar limite mensal: {e}")
 
         return {
             "sucesso": True,

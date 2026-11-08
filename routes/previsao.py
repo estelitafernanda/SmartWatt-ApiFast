@@ -1,10 +1,39 @@
 from fastapi import APIRouter, Depends, HTTPException
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from services.firebase_service import get_db
 from services.auth import usuario_autenticado
 import calendar
 
 router = APIRouter()
+
+FUSO_BR = timezone(timedelta(hours=-3))
+
+def _dias_monitorados(dispositivo: dict, primeiro_dia: str | None, inicio_mes: date, hoje: date) -> int:
+    """Dias (incluindo hoje) desde que o dispositivo começou a ser monitorado no mês.
+
+    O início é o dia do cadastro (ou o 1º dia do mês, se foi cadastrado antes) ou
+    o primeiro dia com consumo registrado, o que vier primeiro.
+    """
+    candidatos = []
+
+    cadastro = dispositivo.get("dataCadastro")
+    if cadastro:
+        try:
+            candidatos.append(max(inicio_mes, cadastro.astimezone(FUSO_BR).date()))
+        except (AttributeError, ValueError):
+            pass
+
+    if primeiro_dia:
+        try:
+            candidatos.append(date.fromisoformat(primeiro_dia))
+        except ValueError:
+            pass
+
+    if not candidatos:
+        return 0
+
+    inicio = min(candidatos)
+    return max(1, (hoje - inicio).days + 1)
 
 
 @router.get("/{uid}")
@@ -25,11 +54,10 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
         dispositivos = (
             db.collection("dispositivos")
               .where("uidUsuario", "==", uid)
-              .where("ativo", "==", True)
               .stream()
         )
 
-        hoje = date.today()
+        hoje = datetime.now(FUSO_BR).date()
         inicio_mes = date(hoje.year, hoje.month, 1)
         dias_passados = (hoje - inicio_mes).days + 1
         dias_no_mes = calendar.monthrange(hoje.year, hoje.month)[1]
@@ -42,6 +70,9 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
 
         for doc in dispositivos:
             dispositivo = doc.to_dict()
+            # Pausados continuam contando no gasto do mês; removidos não.
+            if dispositivo.get("removido"):
+                continue
             sensor_id = dispositivo.get("sensorId", "")
             nome = dispositivo.get("nome", "Dispositivo")
 
@@ -60,16 +91,26 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
             custo_mes = 0.0
             kwh_mes = 0.0
             dias_com_dados = 0
+            primeiro_dia = None
 
             for ac in acumulados:
                 d = ac.to_dict()
                 custo_mes += d.get("custoTotal", 0)
                 kwh_mes += d.get("kwhTotal", 0)
                 dias_com_dados += 1
+                data = d.get("data") or ac.id
+                if primeiro_dia is None or data < primeiro_dia:
+                    primeiro_dia = data
 
-            if dias_com_dados > 0:
-                media_diaria = custo_mes / dias_com_dados
-                kwh_media_diaria = kwh_mes / dias_com_dados
+            # A média usa todos os dias desde o início do monitoramento no mês, e não
+            # só os dias com consumo: dias com o aparelho desligado contam como zero.
+            dias_monitorados = _dias_monitorados(
+                dispositivo, primeiro_dia, inicio_mes, hoje
+            )
+
+            if dias_monitorados > 0:
+                media_diaria = custo_mes / dias_monitorados
+                kwh_media_diaria = kwh_mes / dias_monitorados
             else:
                 media_diaria = 0
                 kwh_media_diaria = 0
@@ -90,6 +131,7 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
                 "kwhMes": round(kwh_mes, 3),
                 "previsaoKwh": round(previsao_kwh, 3),
                 "diasComDados": dias_com_dados,
+                "diasMonitorados": dias_monitorados,
             })
 
         custo_hoje = 0.0
@@ -125,10 +167,16 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
 
 
 @router.get("/hoje/{uid}")
-async def gasto_hoje(uid: str):
+async def gasto_hoje(uid: str, uid_logado: str = Depends(usuario_autenticado)):
     """Retorna gasto acumulado de hoje por dispositivo."""
+    if uid != uid_logado:
+        raise HTTPException(
+            status_code=403,
+            detail="Você não tem permissão para ver os dados de outro usuário.",
+        )
+
     db = get_db()
-    hoje = date.today().isoformat()
+    hoje = datetime.now(FUSO_BR).date().isoformat()
 
     try:
         dispositivos = (
