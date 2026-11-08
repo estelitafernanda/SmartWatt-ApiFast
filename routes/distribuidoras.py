@@ -1,6 +1,7 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from services.firebase_service import get_db
 from services.aneel_service import buscar_distribuidoras
+from services.auth import verificar_api_key
 from datetime import datetime
 
 router = APIRouter()
@@ -37,7 +38,7 @@ async def listar_distribuidoras():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/sincronizar")
+@router.post("/sincronizar", dependencies=[Depends(verificar_api_key)])
 async def sincronizar_distribuidoras():
     """Força sincronização manual com a API da ANEEL."""
     try:

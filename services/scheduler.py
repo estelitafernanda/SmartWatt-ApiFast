@@ -2,9 +2,40 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from services.aneel_service import buscar_distribuidoras
 from services.firebase_service import get_db
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from google.cloud.firestore import Query
 
 scheduler = AsyncIOScheduler()
+
+
+def _sincronizado_recentemente(dias: int = 7) -> bool:
+    """No plano gratuito o Render reinicia a API várias vezes por dia; sem esta
+    checagem, cada reinício regravaria todas as distribuidoras."""
+    try:
+        docs = list(
+            get_db().collection("distribuidoras")
+                .order_by("atualizadoEm", direction=Query.DESCENDING)
+                .limit(1)
+                .stream()
+        )
+        if not docs:
+            return False
+        ultima = docs[0].to_dict().get("atualizadoEm")
+        if not ultima:
+            return False
+        if ultima.tzinfo is None:
+            ultima = ultima.replace(tzinfo=timezone.utc)
+        return datetime.now(timezone.utc) - ultima < timedelta(days=dias)
+    except Exception as e:
+        print(f"Não foi possível verificar a última sincronização: {e}")
+        return False
+
+
+async def atualizar_distribuidoras_se_necessario():
+    if _sincronizado_recentemente():
+        print("Distribuidoras sincronizadas há menos de 7 dias; pulando.")
+        return
+    await atualizar_distribuidoras()
 
 
 async def atualizar_distribuidoras():
@@ -23,7 +54,7 @@ async def atualizar_distribuidoras():
             ref = db.collection("distribuidoras").document(d["sigla"])
             batch.set(ref, {
                 **d,
-                "atualizadoEm": datetime.now(),
+                "atualizadoEm": datetime.now(timezone.utc),
             })
 
         batch.commit()
@@ -46,7 +77,7 @@ def iniciar_agendador():
 
     # Roda também na inicialização para garantir dados frescos
     scheduler.add_job(
-        atualizar_distribuidoras,
+        atualizar_distribuidoras_se_necessario,
         id="atualizar_distribuidoras_inicio",
         replace_existing=True,
     )
