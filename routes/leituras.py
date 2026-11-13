@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 from datetime import datetime, timedelta, timezone
 from firebase_admin import firestore, messaging
 from services.firebase_service import get_db
-from services.aneel_service import buscar_tarifa_com_cache
+from services.aneel_service import buscar_tarifa_com_cache, usar_tarifa_reserva
 
 router = APIRouter()
 
@@ -56,6 +56,36 @@ def _enviar_notificacao(token: str | None, titulo: str, corpo: str, dados: dict)
         print(f"Notificação enviada: {titulo}")
     except Exception as e:
         print(f"Erro ao enviar notificação FCM: {e}")
+
+
+def _tarifa_das_leituras_anteriores(db, uid: str, distribuidora: str, subgrupo: str) -> dict | None:
+    """Reserva para quando a ANEEL está fora do ar: a TE e a TUSD gravadas no
+    acumulado mais recente de algum dispositivo do usuário, da mesma distribuidora."""
+    mais_recente = None
+    for doc in db.collection("dispositivos").where("uidUsuario", "==", uid).stream():
+        sensor_id = doc.to_dict().get("sensorId") or doc.id
+        ultimos = (
+            db.collection("leituras").document(sensor_id)
+              .collection("acumulado")
+              .order_by("data", direction=firestore.Query.DESCENDING)
+              .limit(1)
+              .stream()
+        )
+        for a in ultimos:
+            acc = a.to_dict()
+            if acc.get("distribuidora") != distribuidora or acc.get("subgrupo") != subgrupo:
+                continue
+            if "TE" not in acc or "TUSD" not in acc:
+                continue
+            if not mais_recente or acc.get("data", "") > mais_recente.get("data", ""):
+                mais_recente = acc
+
+    if not mais_recente:
+        return None
+
+    te, tusd = float(mais_recente["TE"]), float(mais_recente["TUSD"])
+    print(f"[ANEEL] usando a tarifa da leitura de {mais_recente.get('data')}: TE={te} TUSD={tusd}")
+    return {"TE": te, "TUSD": tusd, "total": te + tusd}
 
 
 def _custo_do_mes(db, uid: str, agora: datetime) -> float:
@@ -197,6 +227,10 @@ async def receber_leitura(dados: LeituraInput):
         tarifa = await buscar_tarifa_com_cache(
             distribuidora, modalidade, classe, subgrupo
         )
+        if not tarifa:
+            tarifa = _tarifa_das_leituras_anteriores(db, uid, distribuidora, subgrupo)
+            if tarifa:
+                usar_tarifa_reserva(distribuidora, modalidade, classe, subgrupo, tarifa)
         if not tarifa:
             raise HTTPException(
                 status_code=503,

@@ -5,7 +5,11 @@ import os
 from datetime import date
 from dotenv import load_dotenv
 
+from services.firebase_service import get_db
+
 load_dotenv()
+
+TIMEOUT_TARIFA_S = 15
 
 RESOURCE_ID = os.getenv("ANEEL_RESOURCE_ID", "fcf2906c-7c32-4b9b-a637-054e7a5234f4")
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
@@ -78,8 +82,6 @@ async def buscar_tarifa_vigente(
     print(f"\n🔍 Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
 
     try:
-        # Tempo curto: o ESP32 espera no máximo 60 s pela resposta da API, então
-        # a busca na ANEEL não pode consumir esse tempo todo.
         registros = await _consultar(
             {
                 "filters": json.dumps(filtros, ensure_ascii=False),
@@ -129,27 +131,93 @@ CACHE_TARIFA_SEGUNDOS = 6 * 60 * 60
 _cache_tarifa: dict[tuple, tuple[float, dict]] = {}
 
 
+def _id_tarifa(chave: tuple) -> str:
+    """Id do documento em 'tarifas' (sem barras, que o Firestore não aceita)."""
+    return "__".join(chave).replace("/", "-")
+
+
+def _ler_tarifa_salva(chave: tuple) -> tuple[float, dict] | None:
+    """Última tarifa gravada no Firestore: sobrevive aos reinícios do Render."""
+    try:
+        doc = get_db().collection("tarifas").document(_id_tarifa(chave)).get()
+        if doc.exists:
+            dados = doc.to_dict()
+            return float(dados.get("salvaEm", 0)), dados["tarifa"]
+    except Exception as e:
+        print(f"[ANEEL] erro ao ler tarifa salva: {e!r}")
+    return None
+
+
+def _salvar_tarifa(chave: tuple, tarifa: dict) -> None:
+    try:
+        get_db().collection("tarifas").document(_id_tarifa(chave)).set({
+            "tarifa": tarifa,
+            "salvaEm": time.time(),
+        })
+    except Exception as e:
+        print(f"[ANEEL] erro ao salvar tarifa: {e!r}")
+
+
+def usar_tarifa_reserva(
+    distribuidora: str,
+    modalidade: str,
+    classe: str,
+    subgrupo: str,
+    tarifa: dict,
+) -> None:
+    """Guarda uma tarifa de reserva (vinda de leituras anteriores) na memória e no
+    Firestore, para as próximas leituras não ficarem esperando a ANEEL.
+    Ela é marcada como antiga: a ANEEL é consultada de novo em 30 min."""
+    chave = (distribuidora.strip(), modalidade.strip(), classe.strip(), subgrupo.strip())
+    tarifa = {
+        "distribuidora": distribuidora, "modalidade": modalidade,
+        "classe": classe, "subgrupo": subgrupo, **tarifa,
+    }
+    marcada_em = time.time() - CACHE_TARIFA_SEGUNDOS + 30 * 60
+    _cache_tarifa[chave] = (marcada_em, tarifa)
+    try:
+        get_db().collection("tarifas").document(_id_tarifa(chave)).set({
+            "tarifa": tarifa,
+            "salvaEm": marcada_em,
+            "origem": "leituras anteriores",
+        })
+    except Exception as e:
+        print(f"[ANEEL] erro ao salvar tarifa de reserva: {e!r}")
+
+
 async def buscar_tarifa_com_cache(
     distribuidora: str,
     modalidade: str,
     classe: str,
     subgrupo: str = "B1",
 ) -> dict | None:
-    chave = (distribuidora.strip(), modalidade.strip(), classe.strip(), subgrupo.strip())
-    agora = time.monotonic()
-    em_cache = _cache_tarifa.get(chave)
+    """Tarifa vigente, sem deixar a lentidão da ANEEL travar o envio das leituras.
 
-    if em_cache and agora - em_cache[0] < CACHE_TARIFA_SEGUNDOS:
-        return em_cache[1]
+    Ordem: cache em memória -> cópia salva no Firestore -> ANEEL (tempo curto).
+    Se a ANEEL falhar, usa a última tarifa conhecida, mesmo que antiga.
+    """
+    chave = (distribuidora.strip(), modalidade.strip(), classe.strip(), subgrupo.strip())
+    agora = time.time()
+
+    em_memoria = _cache_tarifa.get(chave)
+    if em_memoria and agora - em_memoria[0] < CACHE_TARIFA_SEGUNDOS:
+        return em_memoria[1]
+
+    salva = em_memoria or _ler_tarifa_salva(chave)
+    if salva and agora - salva[0] < CACHE_TARIFA_SEGUNDOS:
+        _cache_tarifa[chave] = salva
+        return salva[1]
 
     tarifa = await buscar_tarifa_vigente(*chave)
     if tarifa:
         _cache_tarifa[chave] = (agora, tarifa)
+        _salvar_tarifa(chave, tarifa)
         return tarifa
 
-    if em_cache:
-        print("[ANEEL] falha ao atualizar a tarifa; usando o valor em cache")
-        return em_cache[1]
+    if salva:
+        print("[ANEEL] falha ao atualizar a tarifa; usando a última tarifa conhecida")
+        _cache_tarifa[chave] = (agora - CACHE_TARIFA_SEGUNDOS + 30 * 60, salva[1])
+        return salva[1]
 
     return None
 
