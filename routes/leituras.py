@@ -14,8 +14,6 @@ FUSO_BR = timezone(timedelta(hours=-3))
 INTERVALO_PADRAO_S = 10
 INTERVALO_MAXIMO_S = 120
 
-# O gasto do mês é recalculado no máximo a cada 5 min por usuário, para não
-# somar os acumulados do mês inteiro a cada leitura.
 VERIFICACAO_MENSAL_S = 5 * 60
 _ultima_verificacao_mensal: dict[str, float] = {}
 
@@ -24,6 +22,7 @@ class LeituraInput(BaseModel):
     sensorId: str = Field(min_length=1)
     corrente: float = Field(ge=0, le=150)
     tensao: float = Field(ge=0, le=300)
+    potenciaAtiva: float | None = Field(default=None, ge=0, le=45000)
 
 
 def _segundos_desde_ultima_leitura(dispositivo: dict, agora: datetime) -> float:
@@ -242,7 +241,14 @@ async def receber_leitura(dados: LeituraInput):
         hora_chave = agora.strftime("%Y-%m-%d-%H")
 
         potencia_aparente_w = dados.corrente * dados.tensao
-        potencia_ativa_w = potencia_aparente_w * fator_potencia
+
+        fp_medido = dados.potenciaAtiva is not None and potencia_aparente_w > 0
+        if fp_medido:
+            potencia_ativa_w = min(dados.potenciaAtiva, potencia_aparente_w)
+            fator_usado = potencia_ativa_w / potencia_aparente_w
+        else:
+            potencia_ativa_w = potencia_aparente_w * fator_potencia
+            fator_usado = fator_potencia
         potencia_kw = potencia_ativa_w / 1000
         custo_hora = potencia_kw * tarifa["total"]
 
@@ -258,7 +264,8 @@ async def receber_leitura(dados: LeituraInput):
                 "tensao": dados.tensao,
                 "potenciaAparenteW": potencia_aparente_w,
                 "potenciaAtivaW": potencia_ativa_w,
-                "fatorPotencia": fator_potencia,
+                "fatorPotencia": fator_usado,
+                "fatorPotenciaMedido": fp_medido,
                 "custoHora": custo_hora,
                 "custoLeitura": custo_leitura,
                 "kwhLeitura": kwh_leitura,
@@ -287,12 +294,14 @@ async def receber_leitura(dados: LeituraInput):
                 "timestamp": agora,
             }, merge=True)
 
-        ref_dispositivo.update({
+        atualizacao = {
             "potenciaW": potencia_ativa_w,
             "custoHora": custo_hora,
-            "fatorPotencia": fator_potencia,
             "ultimaLeitura": agora,
-        })
+        }
+        if fp_medido:
+            atualizacao["fatorPotenciaMedido"] = round(fator_usado, 3)
+        ref_dispositivo.update(atualizacao)
 
         limite_w = usuario.get("limiteDispositivo", 500)
         alerta_ativo = usuario.get("alertaDispositivo", True)
@@ -338,7 +347,8 @@ async def receber_leitura(dados: LeituraInput):
             "sucesso": True,
             "potenciaAparenteW": round(potencia_aparente_w, 2),
             "potenciaAtivaW": round(potencia_ativa_w, 2),
-            "fatorPotencia": fator_potencia,
+            "fatorPotencia": round(fator_usado, 3),
+            "fatorPotenciaMedido": fp_medido,
             "custoHora": round(custo_hora, 4),
             "custoLeitura": round(custo_leitura, 6),
             "kwhLeitura": round(kwh_leitura, 6),
