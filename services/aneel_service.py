@@ -78,13 +78,15 @@ async def buscar_tarifa_vigente(
     print(f"\n🔍 Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
 
     try:
+        # Tempo curto: o ESP32 espera no máximo 60 s pela resposta da API, então
+        # a busca na ANEEL não pode consumir esse tempo todo.
         registros = await _consultar(
             {
                 "filters": json.dumps(filtros, ensure_ascii=False),
                 "sort": "DatInicioVigencia desc",
                 "limit": 100,
             },
-            timeout=60,
+            timeout=TIMEOUT_TARIFA_S,
         )
     except Exception as e:
         print(f"[ANEEL] erro ao buscar tarifa vigente: {e!r}")

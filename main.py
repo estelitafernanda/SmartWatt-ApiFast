@@ -57,7 +57,7 @@ app.include_router(
     tags=["Previsão"],
 )
 
-@app.get("/", tags=["Status"])
+@app.api_route("/", methods=["GET", "HEAD"], tags=["Status"])
 async def raiz():
     return {
         "status": "online",
@@ -73,7 +73,7 @@ async def raiz():
     }
 
 
-@app.get("/health", tags=["Status"])
+@app.api_route("/health", methods=["GET", "HEAD"], tags=["Status"])
 async def health():
     return {"status": "healthy"}
 
@@ -84,5 +84,5 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=int(os.getenv("PORT", 8000)),
-        reload=True,
+        reload=os.getenv("RENDER") is None,
 )
