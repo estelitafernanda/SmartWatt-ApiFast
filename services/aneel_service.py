@@ -84,8 +84,6 @@ async def buscar_tarifa_vigente(
     print(f"\n🔍 Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
 
     try:
-        # Tempo curto: o ESP32 espera no máximo 60 s pela resposta da API, então
-        # a busca na ANEEL não pode consumir esse tempo todo.
         registros = await _consultar(
             {
                 "filters": json.dumps(filtros, ensure_ascii=False),
@@ -108,15 +106,23 @@ async def buscar_tarifa_vigente(
         print("Nenhuma tarifa vigente encontrada!")
         return None
 
-    registro = next(
-        (r for r in vigentes if r.get("NomPostoTarifario") == "Não se aplica"),
-        vigentes[0],
-    )
+    # A mesma classe tem várias subclasses (ex.: "Residencial" e "Baixa Renda", que
+    # tem desconto). Prioriza a subclasse com o mesmo nome da classe e evita a
+    # Baixa Renda, que só vale para quem está no cadastro da Tarifa Social.
+    def _prioridade(r: dict) -> tuple:
+        subclasse = (r.get("DscSubClasse") or "").strip()
+        return (
+            subclasse != classe.strip(),
+            subclasse == "Baixa Renda",
+            r.get("NomPostoTarifario") != "Não se aplica",
+        )
+
+    registro = min(vigentes, key=_prioridade)
 
     te = _parse_valor(registro.get("VlrTE", "0")) / 1000
     tusd = _parse_valor(registro.get("VlrTUSD", "0")) / 1000
 
-    print(f"Tarifa encontrada: TE={te} TUSD={tusd} R$/kWh")
+    print(f"Tarifa encontrada ({registro.get('DscSubClasse')}): TE={te} TUSD={tusd} R$/kWh")
 
     return {
         "distribuidora": distribuidora,
@@ -220,8 +226,6 @@ async def buscar_tarifa_com_cache(
 
     if salva:
         print("[ANEEL] falha ao atualizar a tarifa; usando a última tarifa conhecida")
-        # Guarda na memória para não tentar a ANEEL de novo a cada leitura;
-        # nova tentativa daqui a 30 min.
         _cache_tarifa[chave] = (agora - CACHE_TARIFA_SEGUNDOS + 30 * 60, salva[1])
         return salva[1]
 
