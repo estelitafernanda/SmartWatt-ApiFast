@@ -9,7 +9,9 @@ from services.firebase_service import get_db
 
 load_dotenv()
 
-TIMEOUT_TARIFA_S = 15
+# O portal da ANEEL costuma demorar a responder para servidores fora do Brasil (Render).
+# 40 s ainda fica abaixo dos 60 s que o ESP32 espera pela resposta da API.
+TIMEOUT_TARIFA_S = 40
 
 RESOURCE_ID = os.getenv("ANEEL_RESOURCE_ID", "fcf2906c-7c32-4b9b-a637-054e7a5234f4")
 BASE_URL = "https://dadosabertos.aneel.gov.br/api/3/action/datastore_search"
@@ -82,6 +84,8 @@ async def buscar_tarifa_vigente(
     print(f"\n🔍 Buscando tarifa: {distribuidora} | {modalidade} | {classe} | {subgrupo}")
 
     try:
+        # Tempo curto: o ESP32 espera no máximo 60 s pela resposta da API, então
+        # a busca na ANEEL não pode consumir esse tempo todo.
         registros = await _consultar(
             {
                 "filters": json.dumps(filtros, ensure_ascii=False),
@@ -216,6 +220,8 @@ async def buscar_tarifa_com_cache(
 
     if salva:
         print("[ANEEL] falha ao atualizar a tarifa; usando a última tarifa conhecida")
+        # Guarda na memória para não tentar a ANEEL de novo a cada leitura;
+        # nova tentativa daqui a 30 min.
         _cache_tarifa[chave] = (agora - CACHE_TARIFA_SEGUNDOS + 30 * 60, salva[1])
         return salva[1]
 
