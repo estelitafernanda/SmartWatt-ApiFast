@@ -8,6 +8,62 @@ router = APIRouter()
 
 FUSO_BR = timezone(timedelta(hours=-3))
 
+JANELA_MEDIA_DIAS = 7
+
+
+def _inicio_monitoramento(db, dispositivo: dict, sensor_id: str) -> date | None:
+    """Data em que o dispositivo começou a ser monitorado (cadastro ou primeiro acumulado)."""
+    candidatos = []
+
+    cadastro = dispositivo.get("dataCadastro")
+    if cadastro:
+        try:
+            candidatos.append(cadastro.astimezone(FUSO_BR).date())
+        except (AttributeError, ValueError):
+            pass
+
+    primeiro = (
+        db.collection("leituras")
+          .document(sensor_id)
+          .collection("acumulado")
+          .order_by("data")
+          .limit(1)
+          .stream()
+    )
+    for ac in primeiro:
+        data = ac.to_dict().get("data") or ac.id
+        try:
+            candidatos.append(date.fromisoformat(data))
+        except (TypeError, ValueError):
+            pass
+
+    return min(candidatos) if candidatos else None
+
+
+def _media_ultimos_dias(db, sensor_id: str, hoje: date, dias: int) -> tuple[float, float]:
+    """Média diária de custo e kWh dos últimos `dias` dias completos (sem contar hoje).
+
+    Dias sem registro entram como zero (aparelho desligado).
+    """
+    inicio = hoje - timedelta(days=dias)
+    fim = hoje - timedelta(days=1)
+    acumulados = (
+        db.collection("leituras")
+          .document(sensor_id)
+          .collection("acumulado")
+          .where("data", ">=", inicio.isoformat())
+          .where("data", "<=", fim.isoformat())
+          .stream()
+    )
+    custo = 0.0
+    kwh = 0.0
+    for ac in acumulados:
+        d = ac.to_dict()
+        custo += d.get("custoTotal", 0)
+        kwh += d.get("kwhTotal", 0)
+    return custo / dias, kwh / dias
+
+
 def _dias_monitorados(dispositivo: dict, primeiro_dia: str | None, inicio_mes: date, hoje: date) -> int:
     """Dias (incluindo hoje) desde que o dispositivo começou a ser monitorado no mês.
 
@@ -108,12 +164,24 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
                 dispositivo, primeiro_dia, inicio_mes, hoje
             )
 
-            if dias_monitorados > 0:
+            inicio_monit = _inicio_monitoramento(db, dispositivo, sensor_id)
+            dias_completos = (hoje - inicio_monit).days if inicio_monit else 0
+
+            if dias_completos >= JANELA_MEDIA_DIAS:
+                # Uma semana completa disponível: média móvel dos últimos 7 dias
+                # completos, mesmo que parte deles seja do mês anterior.
+                media_diaria, kwh_media_diaria = _media_ultimos_dias(
+                    db, sensor_id, hoje, JANELA_MEDIA_DIAS
+                )
+                metodo_media = "ultimos7dias"
+            elif dias_monitorados > 0:
                 media_diaria = custo_mes / dias_monitorados
                 kwh_media_diaria = kwh_mes / dias_monitorados
+                metodo_media = "diasMonitorados"
             else:
                 media_diaria = 0
                 kwh_media_diaria = 0
+                metodo_media = "semDados"
 
             previsao_dispositivo = custo_mes + (media_diaria * dias_restantes)
             previsao_kwh = kwh_mes + (kwh_media_diaria * dias_restantes)
@@ -132,6 +200,7 @@ async def obter_previsao(uid: str, uid_logado: str = Depends(usuario_autenticado
                 "previsaoKwh": round(previsao_kwh, 3),
                 "diasComDados": dias_com_dados,
                 "diasMonitorados": dias_monitorados,
+                "metodoMedia": metodo_media,
             })
 
         custo_hoje = 0.0
