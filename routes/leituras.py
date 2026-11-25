@@ -11,7 +11,7 @@ router = APIRouter()
 
 FUSO_BR = timezone(timedelta(hours=-3))
 
-INTERVALO_PADRAO_S = 10
+INTERVALO_PADRAO_S = 30  # primeira leitura: mesmo intervalo de envio do firmware
 INTERVALO_MAXIMO_S = 120
 
 VERIFICACAO_MENSAL_S = 5 * 60
